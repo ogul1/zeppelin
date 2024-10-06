@@ -1,0 +1,853 @@
+# Disable keepAlive and pool
+# https://github.com/actions/virtual-environments/issues/1499#issuecomment-689467080
+# Use the bash login, because we are using miniconda
+# test on core-modules (zeppelin-interpreter,zeppelin-zengine,zeppelin-server),
+# some interpreters are included, because zeppelin-server test depends on them: spark, shell & markdown
+# test interpreter modules except spark, flink, python, rlang, jupyter
+# test interpreter modules for jupyter, python, rlang
+# zeppelin integration test except Spark & Flink
+# user/password => root/root
+# Flink 1.15 supports Python 3.6, 3.7, and 3.8
+# https://nightlies.apache.org/flink/flink-docs-release-1.15/docs/dev/python/installation/
+# test on spark for each spark version & scala version
+# The version combination is based on the facts:
+# 1. official Livy 0.8 binary tarball is built against Spark 2.4
+# 2. official Spark 2.4 binary tarball is built against Scala 2.11
+# 3. Spark 2.4 support Python 2.7, 3.4 to 3.7
+
+name: Modified core
+env:
+  MAVEN_OPTS: -Xms1024M -Xmx2048M -XX:MaxMetaspaceSize=1024m -XX:-UseGCOverheadLimit
+    -Dhttp.keepAlive=false -Dmaven.wagon.http.pool=false -Dmaven.wagon.http.retryHandler.count=3
+  MAVEN_ARGS: -B --no-transfer-progress
+  ZEPPELIN_HELIUM_REGISTRY: helium
+  SPARK_PRINT_LAUNCH_COMMAND: 'true'
+  SPARK_LOCAL_IP: 127.0.0.1
+  ZEPPELIN_LOCAL_IP: 127.0.0.1
+defaults:
+  run:
+    shell: bash -l {0}
+permissions:
+  contents: read
+jobs:
+  core-modules:
+    runs-on: ubuntu-20.04
+    strategy:
+      fail-fast: false
+      matrix:
+        java:
+        - 8
+        - 11
+    steps:
+    - name: Setup Python 3.10
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.10'
+    - name: Install dependencies
+      run: |-
+        python -m pip install --upgrade pip
+        pip install inotify
+    - name: Run inotifywait
+      run: |-
+        python3 -c "
+        import inotify.adapters
+        import inotify.constants
+        import os
+        from datetime import datetime, timezone
+        with open('/home/runner/inotifywait-log-core-modules (${{ matrix.java }}).csv', 'w') as log_file:
+          i = inotify.adapters.InotifyTree('/home/runner/work/zeppelin/zeppelin', inotify.constants.IN_CREATE | inotify.constants.IN_ACCESS)
+          for event in i.event_gen(yield_nones=False):
+            (_, type_names, path, filename) = event
+            now = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.%f') + 'Z'
+            events = ','.join(type_names)
+            log_file.write(f'{now};{path};{filename};{events}\n')
+            log_file.flush()
+            os.fsync(log_file.fileno())
+        " &
+    - name: Checkout
+      uses: actions/checkout@v4
+    - run: touch optcd-3.txt
+    - name: Tune Runner VM
+      uses: ./.github/actions/tune-runner-vm
+    - run: touch optcd-4.txt
+    - name: Set up JDK ${{ matrix.java }}
+      uses: actions/setup-java@v4
+      with:
+        distribution: temurin
+        java-version: ${{ matrix.java }}
+    - run: touch optcd-5.txt
+    - name: Cache local Maven repository
+      uses: actions/cache@v4
+      with:
+        path: |-
+          ~/.m2/repository
+          !~/.m2/repository/org/apache/zeppelin/
+          ~/.spark-dist
+          ~/.cache
+          ~/conda_pkgs_dir
+        key: ${{ runner.os }}-zeppelin-${{ hashFiles('**/pom.xml') }}
+        restore-keys: |-
+          ${{ runner.os }}-zeppelin-
+    - run: touch optcd-6.txt
+    - name: install application with some interpreter
+      run: ./mvnw install -Pbuild-distr -DskipTests -pl zeppelin-server,zeppelin-web,spark-submit,spark/scala-2.12,spark/scala-2.13,markdown,angular,shell
+        -am -Pweb-classic -Phelium-dev -Pexamples ${MAVEN_ARGS}
+    - run: touch optcd-7.txt
+    - name: install and test plugins
+      run: ./mvnw package -pl zeppelin-plugins -amd ${MAVEN_ARGS}
+    - run: touch optcd-8.txt
+    - name: Setup conda environment with python 3.9 and R
+      uses: conda-incubator/setup-miniconda@v3
+      with:
+        activate-environment: python_3_with_R
+        environment-file: testing/env_python_3.9_with_R.yml
+        python-version: 3.9
+        channels: conda-forge,defaults
+        channel-priority: true
+        auto-activate-base: false
+        use-mamba: true
+    - run: touch optcd-9.txt
+    - name: Make IRkernel available to Jupyter
+      run: |-
+        R -e "IRkernel::installspec()"
+        conda list
+        conda info
+    - run: touch optcd-10.txt
+    - name: run tests
+      run: ./mvnw verify -Pusing-packaged-distr -pl zeppelin-server,zeppelin-web,spark-submit,spark/scala-2.12,spark/scala-2.13,markdown,angular,shell
+        -am -Pweb-classic -Phelium-dev -Pexamples -Dtests.to.exclude=**/org/apache/zeppelin/spark/*
+        -DfailIfNoTests=false
+    - run: touch optcd-11.txt
+    - name: Upload inotifywait logs
+      uses: actions/upload-artifact@v4
+      with:
+        name: inotifywait-core-modules (${{ matrix.java }})
+        path: /home/runner/inotifywait-log-core-modules (${{ matrix.java }}).csv
+    name: core-modules (${{ matrix.java }})
+  interpreter-test-non-core:
+    runs-on: ubuntu-20.04
+    strategy:
+      fail-fast: false
+      matrix:
+        java:
+        - 8
+        - 11
+    env:
+      INTERPRETERS: hbase,jdbc,file,flink-cmd,cassandra,elasticsearch,bigquery,alluxio,livy,groovy,java,neo4j,sparql,mongodb,influxdb,shell
+    steps:
+    - name: Setup Python 3.10
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.10'
+    - name: Install dependencies
+      run: |-
+        python -m pip install --upgrade pip
+        pip install inotify
+    - name: Run inotifywait
+      run: |-
+        python3 -c "
+        import inotify.adapters
+        import inotify.constants
+        import os
+        from datetime import datetime, timezone
+        with open('/home/runner/inotifywait-log-interpreter-test-non-core (${{ matrix.java }}).csv', 'w') as log_file:
+          i = inotify.adapters.InotifyTree('/home/runner/work/zeppelin/zeppelin', inotify.constants.IN_CREATE | inotify.constants.IN_ACCESS)
+          for event in i.event_gen(yield_nones=False):
+            (_, type_names, path, filename) = event
+            now = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.%f') + 'Z'
+            events = ','.join(type_names)
+            log_file.write(f'{now};{path};{filename};{events}\n')
+            log_file.flush()
+            os.fsync(log_file.fileno())
+        " &
+    - name: Checkout
+      uses: actions/checkout@v4
+    - run: touch optcd-3.txt
+    - name: Tune Runner VM
+      uses: ./.github/actions/tune-runner-vm
+    - run: touch optcd-4.txt
+    - name: Set up JDK ${{ matrix.java }}
+      uses: actions/setup-java@v4
+      with:
+        distribution: temurin
+        java-version: ${{ matrix.java }}
+    - run: touch optcd-5.txt
+    - name: Cache local Maven repository
+      uses: actions/cache@v4
+      with:
+        path: |-
+          ~/.m2/repository
+          !~/.m2/repository/org/apache/zeppelin/
+          ~/.spark-dist
+          ~/.cache
+        key: ${{ runner.os }}-zeppelin-${{ hashFiles('**/pom.xml') }}
+        restore-keys: |-
+          ${{ runner.os }}-zeppelin-
+    - run: touch optcd-6.txt
+    - name: install environment
+      run: ./mvnw install -DskipTests -am -pl ${INTERPRETERS} ${MAVEN_ARGS}
+    - run: touch optcd-7.txt
+    - name: Setup conda environment with python 3.9 and R
+      uses: conda-incubator/setup-miniconda@v3
+      with:
+        activate-environment: python_3_with_R_and_tensorflow
+        environment-file: testing/env_python_3_with_R_and_tensorflow.yml
+        python-version: 3.9
+        channels: conda-forge,defaults
+        channel-priority: true
+        auto-activate-base: false
+        use-mamba: true
+    - run: touch optcd-8.txt
+    - name: verify interpreter
+      run: ./mvnw verify -am -pl ${INTERPRETERS} ${MAVEN_ARGS}
+    - run: touch optcd-9.txt
+    - name: Upload inotifywait logs
+      uses: actions/upload-artifact@v4
+      with:
+        name: inotifywait-interpreter-test-non-core (${{ matrix.java }})
+        path: /home/runner/inotifywait-log-interpreter-test-non-core (${{ matrix.java
+          }}).csv
+    name: interpreter-test-non-core (${{ matrix.java }})
+  interpreter-test-jupyter-python-rlang:
+    runs-on: ubuntu-20.04
+    strategy:
+      fail-fast: false
+      matrix:
+        python:
+        - 3.9
+        java:
+        - 8
+        - 11
+        include:
+        - python: 3.7
+          java: 8
+        - python: 3.8
+          java: 8
+    steps:
+    - name: Setup Python 3.10
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.10'
+    - name: Install dependencies
+      run: |-
+        python -m pip install --upgrade pip
+        pip install inotify
+    - name: Run inotifywait
+      run: |-
+        python3 -c "
+        import inotify.adapters
+        import inotify.constants
+        import os
+        from datetime import datetime, timezone
+        with open('/home/runner/inotifywait-log-interpreter-test-jupyter-python-rlang (${{ matrix.python }}, ${{ matrix.java }}).csv', 'w') as log_file:
+          i = inotify.adapters.InotifyTree('/home/runner/work/zeppelin/zeppelin', inotify.constants.IN_CREATE | inotify.constants.IN_ACCESS)
+          for event in i.event_gen(yield_nones=False):
+            (_, type_names, path, filename) = event
+            now = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.%f') + 'Z'
+            events = ','.join(type_names)
+            log_file.write(f'{now};{path};{filename};{events}\n')
+            log_file.flush()
+            os.fsync(log_file.fileno())
+        " &
+    - name: Checkout
+      uses: actions/checkout@v4
+    - run: touch optcd-3.txt
+    - name: Tune Runner VM
+      uses: ./.github/actions/tune-runner-vm
+    - run: touch optcd-4.txt
+    - name: Set up JDK ${{ matrix.java }}
+      uses: actions/setup-java@v4
+      with:
+        distribution: temurin
+        java-version: ${{ matrix.java }}
+    - run: touch optcd-5.txt
+    - name: Cache local Maven repository
+      uses: actions/cache@v4
+      with:
+        path: |-
+          ~/.m2/repository
+          !~/.m2/repository/org/apache/zeppelin/
+          ~/.spark-dist
+          ~/.cache
+        key: ${{ runner.os }}-zeppelin-${{ hashFiles('**/pom.xml') }}
+        restore-keys: |-
+          ${{ runner.os }}-zeppelin-
+    - run: touch optcd-6.txt
+    - name: Setup conda environment with python ${{ matrix.python }} and R
+      uses: conda-incubator/setup-miniconda@v3
+      with:
+        activate-environment: python_3_with_R
+        environment-file: testing/env_python_${{ matrix.python }}_with_R.yml
+        python-version: ${{ matrix.python }}
+        channels: conda-forge,defaults
+        channel-priority: true
+        auto-activate-base: false
+        use-mamba: true
+    - run: touch optcd-7.txt
+    - name: Make IRkernel available to Jupyter
+      run: |-
+        R -e "IRkernel::installspec()"
+    - run: touch optcd-8.txt
+    - name: install environment
+      run: |-
+        ./mvnw install -DskipTests -pl python,rlang,zeppelin-jupyter-interpreter -am ${MAVEN_ARGS}
+    - run: touch optcd-9.txt
+    - name: run tests with ${{ matrix.python }}
+      run: |-
+        ./mvnw test -pl python,rlang,zeppelin-jupyter-interpreter -DfailIfNoTests=false ${MAVEN_ARGS}
+    - run: touch optcd-10.txt
+    - name: Upload inotifywait logs
+      uses: actions/upload-artifact@v4
+      with:
+        name: inotifywait-interpreter-test-jupyter-python-rlang (${{ matrix.python
+          }}, ${{ matrix.java }})
+        path: /home/runner/inotifywait-log-interpreter-test-jupyter-python-rlang (${{
+          matrix.python }}, ${{ matrix.java }}).csv
+    name: interpreter-test-jupyter-python-rlang (${{ matrix.python }}, ${{ matrix.java
+      }})
+  zeppelin-integration-test:
+    runs-on: ubuntu-20.04
+    strategy:
+      fail-fast: false
+      matrix:
+        java:
+        - 8
+        - 11
+    steps:
+    - name: Setup Python 3.10
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.10'
+    - name: Install dependencies
+      run: |-
+        python -m pip install --upgrade pip
+        pip install inotify
+    - name: Run inotifywait
+      run: |-
+        python3 -c "
+        import inotify.adapters
+        import inotify.constants
+        import os
+        from datetime import datetime, timezone
+        with open('/home/runner/inotifywait-log-zeppelin-integration-test (${{ matrix.java }}).csv', 'w') as log_file:
+          i = inotify.adapters.InotifyTree('/home/runner/work/zeppelin/zeppelin', inotify.constants.IN_CREATE | inotify.constants.IN_ACCESS)
+          for event in i.event_gen(yield_nones=False):
+            (_, type_names, path, filename) = event
+            now = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.%f') + 'Z'
+            events = ','.join(type_names)
+            log_file.write(f'{now};{path};{filename};{events}\n')
+            log_file.flush()
+            os.fsync(log_file.fileno())
+        " &
+    - name: Start mysql
+      run: sudo systemctl start mysql.service
+    - run: touch optcd-3.txt
+    - name: Checkout
+      uses: actions/checkout@v4
+    - run: touch optcd-4.txt
+    - name: Tune Runner VM
+      uses: ./.github/actions/tune-runner-vm
+    - run: touch optcd-5.txt
+    - name: Set up JDK ${{ matrix.java }}
+      uses: actions/setup-java@v4
+      with:
+        distribution: temurin
+        java-version: ${{ matrix.java }}
+    - run: touch optcd-6.txt
+    - name: Cache local Maven repository
+      uses: actions/cache@v4
+      with:
+        path: |-
+          ~/.m2/repository
+          !~/.m2/repository/org/apache/zeppelin/
+          ~/.spark-dist
+          ~/.cache
+        key: ${{ runner.os }}-zeppelin-${{ hashFiles('**/pom.xml') }}
+        restore-keys: |-
+          ${{ runner.os }}-zeppelin-
+    - run: touch optcd-7.txt
+    - name: install environment
+      run: |-
+        ./mvnw install -DskipTests -Pintegration -pl zeppelin-interpreter-integration,zeppelin-web,spark-submit,spark/scala-2.12,spark/scala-2.13,markdown,flink-cmd,flink/flink-scala-2.12,jdbc,shell -am -Pweb-classic -Pflink-117 ${MAVEN_ARGS}
+        ./mvnw package -pl zeppelin-plugins -amd -DskipTests ${MAVEN_ARGS}
+    - run: touch optcd-8.txt
+    - name: Setup conda environment with python 3.9 and R
+      uses: conda-incubator/setup-miniconda@v3
+      with:
+        activate-environment: python_3_with_R
+        environment-file: testing/env_python_3_with_R.yml
+        python-version: 3.9
+        channels: conda-forge,defaults
+        channel-priority: true
+        auto-activate-base: false
+        use-mamba: true
+    - run: touch optcd-9.txt
+    - name: Make IRkernel available to Jupyter
+      run: |-
+        R -e "IRkernel::installspec()"
+    - run: touch optcd-10.txt
+    - name: run tests
+      run: ./mvnw test -pl zeppelin-interpreter-integration -Pintegration -DfailIfNoTests=false
+        -Dtest=ZeppelinClientIntegrationTest,ZeppelinClientWithAuthIntegrationTest,ZSessionIntegrationTest,ShellIntegrationTest,JdbcIntegrationTest
+    - run: touch optcd-11.txt
+    - name: Print zeppelin logs
+      run: if [ -d "logs" ]; then cat logs/*; fi
+    - run: touch optcd-12.txt
+    - name: Upload inotifywait logs
+      uses: actions/upload-artifact@v4
+      with:
+        name: inotifywait-zeppelin-integration-test (${{ matrix.java }})
+        path: /home/runner/inotifywait-log-zeppelin-integration-test (${{ matrix.java
+          }}).csv
+    name: zeppelin-integration-test (${{ matrix.java }})
+  flink-test-and-flink-integration-test:
+    runs-on: ubuntu-20.04
+    strategy:
+      fail-fast: false
+      matrix:
+        python:
+        - 3.9
+        flink:
+        - 116
+        - 117
+        include:
+        - python: 3.8
+          flink: 115
+    steps:
+    - name: Setup Python 3.10
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.10'
+    - name: Install dependencies
+      run: |-
+        python -m pip install --upgrade pip
+        pip install inotify
+    - name: Run inotifywait
+      run: |-
+        python3 -c "
+        import inotify.adapters
+        import inotify.constants
+        import os
+        from datetime import datetime, timezone
+        with open('/home/runner/inotifywait-log-flink-test-and-flink-integration-test (${{ matrix.python }}, ${{ matrix.flink }}).csv', 'w') as log_file:
+          i = inotify.adapters.InotifyTree('/home/runner/work/zeppelin/zeppelin', inotify.constants.IN_CREATE | inotify.constants.IN_ACCESS)
+          for event in i.event_gen(yield_nones=False):
+            (_, type_names, path, filename) = event
+            now = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.%f') + 'Z'
+            events = ','.join(type_names)
+            log_file.write(f'{now};{path};{filename};{events}\n')
+            log_file.flush()
+            os.fsync(log_file.fileno())
+        " &
+    - name: Checkout
+      uses: actions/checkout@v4
+    - run: touch optcd-3.txt
+    - name: Tune Runner VM
+      uses: ./.github/actions/tune-runner-vm
+    - run: touch optcd-4.txt
+    - name: Set up JDK 8
+      uses: actions/setup-java@v4
+      with:
+        distribution: temurin
+        java-version: 8
+    - run: touch optcd-5.txt
+    - name: Cache local Maven repository
+      uses: actions/cache@v4
+      with:
+        path: |-
+          ~/.m2/repository
+          !~/.m2/repository/org/apache/zeppelin/
+          ~/.spark-dist
+          ~/.cache
+        key: ${{ runner.os }}-zeppelin-${{ hashFiles('**/pom.xml') }}
+        restore-keys: |-
+          ${{ runner.os }}-zeppelin-
+    - run: touch optcd-6.txt
+    - name: install environment for flink
+      run: |-
+        ./mvnw install -DskipTests -am -pl flink/flink-scala-2.12,flink-cmd,zeppelin-interpreter-integration -Pflink-${{ matrix.flink }} -Pintegration ${MAVEN_ARGS}
+        ./mvnw clean package -pl zeppelin-plugins -amd -DskipTests ${MAVEN_ARGS}
+    - run: touch optcd-7.txt
+    - name: Setup conda environment with python ${{ matrix.python }} and R
+      uses: conda-incubator/setup-miniconda@v3
+      with:
+        activate-environment: python_3_with_flink
+        environment-file: testing/env_python_3_with_flink_${{ matrix.flink }}.yml
+        python-version: ${{ matrix.python }}
+        channels: conda-forge,defaults
+        channel-priority: true
+        auto-activate-base: false
+        use-mamba: true
+    - run: touch optcd-8.txt
+    - name: run tests for flink
+      run: ./mvnw verify -pl flink/flink-scala-2.12,flink-cmd,zeppelin-interpreter-integration
+        -Pflink-${{ matrix.flink }} -am -Pintegration -DfailIfNoTests=false -Dtest=org.apache.zeppelin.flink.*Test,FlinkIntegrationTest${{
+        matrix.flink }} ${MAVEN_ARGS}
+    - run: touch optcd-9.txt
+    - name: Print zeppelin logs
+      run: if [ -d "logs" ]; then cat logs/*; fi
+    - run: touch optcd-10.txt
+    - name: Upload inotifywait logs
+      uses: actions/upload-artifact@v4
+      with:
+        name: inotifywait-flink-test-and-flink-integration-test (${{ matrix.python
+          }}, ${{ matrix.flink }})
+        path: /home/runner/inotifywait-log-flink-test-and-flink-integration-test (${{
+          matrix.python }}, ${{ matrix.flink }}).csv
+    name: flink-test-and-flink-integration-test (${{ matrix.python }}, ${{ matrix.flink
+      }})
+  spark-integration-test:
+    runs-on: ubuntu-20.04
+    strategy:
+      fail-fast: false
+      matrix:
+        java:
+        - 8
+        - 11
+    steps:
+    - name: Setup Python 3.10
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.10'
+    - name: Install dependencies
+      run: |-
+        python -m pip install --upgrade pip
+        pip install inotify
+    - name: Run inotifywait
+      run: |-
+        python3 -c "
+        import inotify.adapters
+        import inotify.constants
+        import os
+        from datetime import datetime, timezone
+        with open('/home/runner/inotifywait-log-spark-integration-test (${{ matrix.java }}).csv', 'w') as log_file:
+          i = inotify.adapters.InotifyTree('/home/runner/work/zeppelin/zeppelin', inotify.constants.IN_CREATE | inotify.constants.IN_ACCESS)
+          for event in i.event_gen(yield_nones=False):
+            (_, type_names, path, filename) = event
+            now = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.%f') + 'Z'
+            events = ','.join(type_names)
+            log_file.write(f'{now};{path};{filename};{events}\n')
+            log_file.flush()
+            os.fsync(log_file.fileno())
+        " &
+    - name: Checkout
+      uses: actions/checkout@v4
+    - run: touch optcd-3.txt
+    - name: Tune Runner VM
+      uses: ./.github/actions/tune-runner-vm
+    - run: touch optcd-4.txt
+    - name: Set up JDK ${{ matrix.java }}
+      uses: actions/setup-java@v4
+      with:
+        distribution: temurin
+        java-version: ${{ matrix.java }}
+    - run: touch optcd-5.txt
+    - name: Cache local Maven repository
+      uses: actions/cache@v4
+      with:
+        path: |-
+          ~/.m2/repository
+          !~/.m2/repository/org/apache/zeppelin/
+          ~/.spark-dist
+          ~/.cache
+        key: ${{ runner.os }}-zeppelin-${{ hashFiles('**/pom.xml') }}
+        restore-keys: |-
+          ${{ runner.os }}-zeppelin-
+    - run: touch optcd-6.txt
+    - name: install environment
+      run: |-
+        ./mvnw install -DskipTests -pl zeppelin-interpreter-integration,zeppelin-web,spark-submit,spark/scala-2.12,spark/scala-2.13,markdown -am -Pweb-classic -Pintegration ${MAVEN_ARGS}
+        ./mvnw clean package -pl zeppelin-plugins -amd -DskipTests ${MAVEN_ARGS}
+    - run: touch optcd-7.txt
+    - name: Setup conda environment with python 3.9 and R
+      uses: conda-incubator/setup-miniconda@v3
+      with:
+        activate-environment: python_3_with_R
+        environment-file: testing/env_python_3_with_R.yml
+        python-version: 3.9
+        channels: conda-forge,defaults
+        channel-priority: true
+        auto-activate-base: false
+        use-mamba: true
+    - run: touch optcd-8.txt
+    - name: Make IRkernel available to Jupyter
+      run: |-
+        R -e "IRkernel::installspec()"
+    - run: touch optcd-9.txt
+    - name: run tests
+      run: ./mvnw test -pl zeppelin-interpreter-integration -Pintegration -Dtest=SparkSubmitIntegrationTest,ZeppelinSparkClusterTest32,SparkIntegrationTest32,ZeppelinSparkClusterTest33,SparkIntegrationTest33
+        -DfailIfNoTests=false ${MAVEN_ARGS}
+    - run: touch optcd-10.txt
+    - name: Upload inotifywait logs
+      uses: actions/upload-artifact@v4
+      with:
+        name: inotifywait-spark-integration-test (${{ matrix.java }})
+        path: /home/runner/inotifywait-log-spark-integration-test (${{ matrix.java
+          }}).csv
+    name: spark-integration-test (${{ matrix.java }})
+  spark-test:
+    runs-on: ubuntu-20.04
+    strategy:
+      fail-fast: false
+      matrix:
+        python:
+        - 3.9
+        java:
+        - 8
+        - 11
+        include:
+        - python: 3.7
+          java: 8
+        - python: 3.8
+          java: 8
+    steps:
+    - name: Setup Python 3.10
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.10'
+    - name: Install dependencies
+      run: |-
+        python -m pip install --upgrade pip
+        pip install inotify
+    - name: Run inotifywait
+      run: |-
+        python3 -c "
+        import inotify.adapters
+        import inotify.constants
+        import os
+        from datetime import datetime, timezone
+        with open('/home/runner/inotifywait-log-spark-test (${{ matrix.python }}, ${{ matrix.java }}).csv', 'w') as log_file:
+          i = inotify.adapters.InotifyTree('/home/runner/work/zeppelin/zeppelin', inotify.constants.IN_CREATE | inotify.constants.IN_ACCESS)
+          for event in i.event_gen(yield_nones=False):
+            (_, type_names, path, filename) = event
+            now = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.%f') + 'Z'
+            events = ','.join(type_names)
+            log_file.write(f'{now};{path};{filename};{events}\n')
+            log_file.flush()
+            os.fsync(log_file.fileno())
+        " &
+    - name: Checkout
+      uses: actions/checkout@v4
+    - run: touch optcd-3.txt
+    - name: Tune Runner VM
+      uses: ./.github/actions/tune-runner-vm
+    - run: touch optcd-4.txt
+    - name: Set up JDK ${{ matrix.java }}
+      uses: actions/setup-java@v4
+      with:
+        distribution: temurin
+        java-version: ${{ matrix.java }}
+    - run: touch optcd-5.txt
+    - name: Cache local Maven repository
+      uses: actions/cache@v4
+      with:
+        path: |-
+          ~/.m2/repository
+          !~/.m2/repository/org/apache/zeppelin/
+          ~/.spark-dist
+          ~/.cache
+        key: ${{ runner.os }}-zeppelin-${{ hashFiles('**/pom.xml') }}
+        restore-keys: |-
+          ${{ runner.os }}-zeppelin-
+    - run: touch optcd-6.txt
+    - name: install environment
+      run: ./mvnw install -DskipTests -pl spark-submit,spark/scala-2.12,spark/scala-2.13
+        -am ${MAVEN_ARGS}
+    - run: touch optcd-7.txt
+    - name: Setup conda environment with python ${{ matrix.python }} and R
+      uses: conda-incubator/setup-miniconda@v3
+      with:
+        activate-environment: python_3_with_R
+        environment-file: testing/env_python_${{ matrix.python }}_with_R.yml
+        python-version: ${{ matrix.python }}
+        channels: conda-forge,defaults
+        channel-priority: true
+        auto-activate-base: false
+        use-mamba: true
+    - run: touch optcd-8.txt
+    - name: Make IRkernel available to Jupyter
+      run: |-
+        R -e "IRkernel::installspec()"
+    - run: touch optcd-9.txt
+    - name: run spark-3.3 tests with scala-2.12 and python-${{ matrix.python }}
+      run: |-
+        rm -rf spark/interpreter/metastore_db
+        ./mvnw verify -pl spark-submit,spark/interpreter -am -Dtest=org/apache/zeppelin/spark/* -Pspark-3.3 -Pspark-scala-2.12 -Pintegration -DfailIfNoTests=false ${MAVEN_ARGS}
+    - run: touch optcd-10.txt
+    - name: run spark-3.3 tests with scala-2.13 and python-${{ matrix.python }}
+      run: |-
+        rm -rf spark/interpreter/metastore_db
+        ./mvnw verify -pl spark-submit,spark/interpreter -am -Dtest=org/apache/zeppelin/spark/* -Pspark-3.3 -Pspark-scala-2.13 -Pintegration -DfailIfNoTests=false ${MAVEN_ARGS}
+    - run: touch optcd-11.txt
+    - name: run spark-3.4 tests with scala-2.13 and python-${{ matrix.python }}
+      run: |-
+        rm -rf spark/interpreter/metastore_db
+        ./mvnw verify -pl spark-submit,spark/interpreter -am -Dtest=org/apache/zeppelin/spark/* -Pspark-3.4 -Pspark-scala-2.13 -Pintegration -DfailIfNoTests=false ${MAVEN_ARGS}
+    - run: touch optcd-12.txt
+    - name: run spark-3.5 tests with scala-2.13 and python-${{ matrix.python }}
+      run: |-
+        rm -rf spark/interpreter/metastore_db
+        ./mvnw verify -pl spark-submit,spark/interpreter -am -Dtest=org/apache/zeppelin/spark/* -Pspark-3.5 -Pspark-scala-2.13 -Pintegration -DfailIfNoTests=false ${MAVEN_ARGS}
+    - run: touch optcd-13.txt
+    - name: Upload inotifywait logs
+      uses: actions/upload-artifact@v4
+      with:
+        name: inotifywait-spark-test (${{ matrix.python }}, ${{ matrix.java }})
+        path: /home/runner/inotifywait-log-spark-test (${{ matrix.python }}, ${{ matrix.java
+          }}).csv
+    name: spark-test (${{ matrix.python }}, ${{ matrix.java }})
+  livy-0-8-with-spark-2-4-under-python37:
+    runs-on: ubuntu-20.04
+    steps:
+    - name: Setup Python 3.10
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.10'
+    - name: Install dependencies
+      run: |-
+        python -m pip install --upgrade pip
+        pip install inotify
+    - name: Run inotifywait
+      run: |-
+        python3 -c "
+        import inotify.adapters
+        import inotify.constants
+        import os
+        from datetime import datetime, timezone
+        with open('/home/runner/inotifywait-log-livy-0-8-with-spark-2-4-under-python37.csv', 'w') as log_file:
+          i = inotify.adapters.InotifyTree('/home/runner/work/zeppelin/zeppelin', inotify.constants.IN_CREATE | inotify.constants.IN_ACCESS)
+          for event in i.event_gen(yield_nones=False):
+            (_, type_names, path, filename) = event
+            now = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.%f') + 'Z'
+            events = ','.join(type_names)
+            log_file.write(f'{now};{path};{filename};{events}\n')
+            log_file.flush()
+            os.fsync(log_file.fileno())
+        " &
+    - name: Checkout
+      uses: actions/checkout@v4
+    - run: touch optcd-3.txt
+    - name: Tune Runner VM
+      uses: ./.github/actions/tune-runner-vm
+    - run: touch optcd-4.txt
+    - name: Set up JDK 8
+      uses: actions/setup-java@v4
+      with:
+        distribution: temurin
+        java-version: 8
+    - run: touch optcd-5.txt
+    - name: Cache local Maven repository
+      uses: actions/cache@v4
+      with:
+        path: |-
+          ~/.m2/repository
+          !~/.m2/repository/org/apache/zeppelin/
+          ~/.spark-dist
+          ~/.cache
+        key: ${{ runner.os }}-zeppelin-${{ hashFiles('**/pom.xml') }}
+        restore-keys: |-
+          ${{ runner.os }}-zeppelin-
+    - run: touch optcd-6.txt
+    - name: install environment
+      run: |-
+        ./mvnw install -DskipTests -pl livy -am  ${MAVEN_ARGS}
+        ./testing/downloadSpark.sh "2.4.8" "2.7"
+        ./testing/downloadLivy.sh "0.8.0-incubating" "2.11"
+    - run: touch optcd-7.txt
+    - name: Setup conda environment with python 3.7 and R
+      uses: conda-incubator/setup-miniconda@v3
+      with:
+        activate-environment: python_37_with_R
+        environment-file: testing/env_python_3.7_with_R.yml
+        python-version: 3.7
+        channels: conda-forge,defaults
+        channel-priority: true
+        auto-activate-base: false
+        use-mamba: true
+    - run: touch optcd-8.txt
+    - name: Make IRkernel available to Jupyter
+      run: |-
+        R -e "IRkernel::installspec()"
+    - run: touch optcd-9.txt
+    - name: run tests
+      run: |-
+        export SPARK_HOME=$PWD/spark-2.4.8-bin-hadoop2.7
+        export LIVY_HOME=$PWD/apache-livy-0.8.0-incubating_2.11-bin
+        ./mvnw verify -pl livy -am ${MAVEN_ARGS}
+    - run: touch optcd-10.txt
+    - name: Upload inotifywait logs
+      uses: actions/upload-artifact@v4
+      with:
+        name: inotifywait-livy-0-8-with-spark-2-4-under-python37
+        path: /home/runner/inotifywait-log-livy-0-8-with-spark-2-4-under-python37.csv
+    name: livy-0-8-with-spark-2-4-under-python37
+  default-build:
+    runs-on: ubuntu-20.04
+    strategy:
+      fail-fast: false
+      matrix:
+        java:
+        - 8
+        - 11
+    steps:
+    - name: Setup Python 3.10
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.10'
+    - name: Install dependencies
+      run: |-
+        python -m pip install --upgrade pip
+        pip install inotify
+    - name: Run inotifywait
+      run: |-
+        python3 -c "
+        import inotify.adapters
+        import inotify.constants
+        import os
+        from datetime import datetime, timezone
+        with open('/home/runner/inotifywait-log-default-build (${{ matrix.java }}).csv', 'w') as log_file:
+          i = inotify.adapters.InotifyTree('/home/runner/work/zeppelin/zeppelin', inotify.constants.IN_CREATE | inotify.constants.IN_ACCESS)
+          for event in i.event_gen(yield_nones=False):
+            (_, type_names, path, filename) = event
+            now = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.%f') + 'Z'
+            events = ','.join(type_names)
+            log_file.write(f'{now};{path};{filename};{events}\n')
+            log_file.flush()
+            os.fsync(log_file.fileno())
+        " &
+    - name: Checkout
+      uses: actions/checkout@v4
+    - run: touch optcd-3.txt
+    - name: Tune Runner VM
+      uses: ./.github/actions/tune-runner-vm
+    - run: touch optcd-4.txt
+    - name: Set up JDK ${{ matrix.java }}
+      uses: actions/setup-java@v4
+      with:
+        distribution: temurin
+        java-version: ${{ matrix.java }}
+    - run: touch optcd-5.txt
+    - name: Cache local Maven repository
+      uses: actions/cache@v4
+      with:
+        path: |-
+          ~/.m2/repository
+          !~/.m2/repository/org/apache/zeppelin/
+          ~/.spark-dist
+          ~/.cache
+        key: ${{ runner.os }}-zeppelin-${{ hashFiles('**/pom.xml') }}
+        restore-keys: |-
+          ${{ runner.os }}-zeppelin-
+    - run: touch optcd-6.txt
+    - name: build without any profiles
+      run: ./mvnw clean verify -DskipTests ${MAVEN_ARGS}
+    - run: touch optcd-7.txt
+    - name: Upload inotifywait logs
+      uses: actions/upload-artifact@v4
+      with:
+        name: inotifywait-default-build (${{ matrix.java }})
+        path: /home/runner/inotifywait-log-default-build (${{ matrix.java }}).csv
+    name: default-build (${{ matrix.java }})
+'on':
+- push
+- workflow_dispatch
